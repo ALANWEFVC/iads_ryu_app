@@ -1,0 +1,269 @@
+# modules/rfu.py
+"""结果融合单元(RFU)模块"""
+
+import numpy as np
+import time
+from collections import defaultdict
+from config import *
+
+
+class ResultFusionUnit:
+    """结果融合单元"""
+
+    def __init__(self, esm, aps):
+        self.esm = esm
+        self.aps = aps
+
+        # 统计信息
+        self.stats = {
+            'total_updates': 0,
+            'total_rewards': 0,
+            'reward_history': [],
+            'uncertainty_reduction_history': []
+        }
+
+        # 缓存探测前的状态
+        self.cached_states_before = {}
+
+    def cache_states_before_probe(self, tasks):
+        """缓存探测前的状态
+
+        Args:
+            tasks: 即将探测的任务列表
+        """
+        self.cached_states_before = {}
+
+        for task_info in tasks:
+            task = task_info['task']
+            key = (task.entity_id, task.metric)
+            state = self.esm.get_state(task.entity_id, task.metric)
+
+            if state:
+                self.cached_states_before[key] = {
+                    'uncertainty': state.get_uncertainty(),
+                    'stability': state.get_stability(),
+                    'distribution': state.distribution.to_dict()
+                }
+
+    def process_results(self, probe_results):
+        """处理探测结果
+
+        Args:
+            probe_results: PE返回的探测结果列表
+
+        Returns:
+            dict: 处理结果摘要
+        """
+        if not probe_results:
+            return {'status': 'no_results'}
+
+        # 1. 更新ESM状态
+        updated_states = []
+        failed_updates = []
+
+        for result in probe_results:
+            if result.success:
+                try:
+                    # 根据指标类型处理测量值
+                    measurement = self._process_measurement(result)
+
+                    # 更新状态
+                    self.esm.update_state(
+                        result.task.entity_id,
+                        result.task.metric,
+                        measurement,
+                        result.timestamp
+                    )
+
+                    updated_states.append({
+                        'entity_id': result.task.entity_id,
+                        'metric': result.task.metric,
+                        'measurement': measurement,
+                        'timestamp': result.timestamp
+                    })
+
+                except Exception as e:
+                    failed_updates.append({
+                        'task': result.task,
+                        'error': str(e)
+                    })
+            else:
+                # 探测失败的处理
+                # 对于Liveness，失败意味着DOWN
+                if result.task.metric == METRICS['LIVENESS']:
+                    self.esm.update_state(
+                        result.task.entity_id,
+                        result.task.metric,
+                        False,  # DOWN
+                        result.timestamp
+                    )
+
+                failed_updates.append({
+                    'task': result.task,
+                    'error': result.error or 'Probe failed'
+                })
+
+        # 2. 计算奖励
+        reward = self._calculate_reward(probe_results)
+
+        # 3. 更新CMAB
+        self.aps.update_reward(reward)
+
+        # 4. 更新统计信息
+        self.stats['total_updates'] += len(updated_states)
+        self.stats['total_rewards'] += 1
+        self.stats['reward_history'].append(reward)
+        if len(self.stats['reward_history']) > 1000:
+            self.stats['reward_history'].pop(0)
+
+        return {
+            'status': 'success',
+            'updated_states': len(updated_states),
+            'failed_updates': len(failed_updates),
+            'reward': reward,
+            'details': {
+                'updated': updated_states[:5],  # 前5个
+                'failed': failed_updates[:5]  # 前5个
+            }
+        }
+
+    def _process_measurement(self, result):
+        """处理测量值
+
+        Args:
+            result: 探测结果
+
+        Returns:
+            processed_value: 处理后的测量值
+        """
+        if result.task.metric == METRICS['LIVENESS']:
+            # Liveness: 布尔值
+            return bool(result.value)
+
+        elif result.task.metric == METRICS['RTT']:
+            # RTT: 确保是正数，单位毫秒
+            return max(0.1, float(result.value))
+
+        elif result.task.metric == METRICS['PLR']:
+            # PLR: 确保在[0,1]范围内
+            return max(0.0, min(1.0, float(result.value)))
+
+        elif result.task.metric == METRICS['BANDWIDTH']:
+            # Bandwidth: 确保是正数，单位Mbps
+            return max(1.0, float(result.value))
+
+        return result.value
+
+    def _calculate_reward(self, probe_results):
+        """计算奖励
+
+        r_t = 0.7 * ΔUncertainty_normalized - 0.3 * K_normalized
+
+        Args:
+            probe_results: 探测结果列表
+
+        Returns:
+            float: 奖励值
+        """
+        # 计算不确定性减少
+        total_uncertainty_reduction = 0.0
+        affected_count = 0
+
+        for result in probe_results:
+            if not result.success:
+                continue
+
+            key = (result.task.entity_id, result.task.metric)
+
+            # 获取探测前的不确定性
+            if key in self.cached_states_before:
+                h_before = self.cached_states_before[key]['uncertainty']
+            else:
+                continue
+
+            # 获取探测后的不确定性
+            state = self.esm.get_state(result.task.entity_id, result.task.metric)
+            if state:
+                h_after = state.get_uncertainty()
+                reduction = h_before - h_after
+
+                if reduction > 0:
+                    total_uncertainty_reduction += reduction
+                    affected_count += 1
+
+        # 归一化不确定性减少
+        max_reduction = REWARD_CONFIG['max_uncertainty_reduction'] * len(probe_results)
+        uncertainty_normalized = total_uncertainty_reduction / max_reduction if max_reduction > 0 else 0
+
+        # 归一化探测成本
+        k_normalized = len(probe_results) / SYSTEM_CONFIG['max_parallel_probes']
+
+        # 计算奖励
+        reward = (
+                REWARD_CONFIG['uncertainty_weight'] * uncertainty_normalized -
+                REWARD_CONFIG['cost_weight'] * k_normalized
+        )
+
+        # 记录不确定性减少历史
+        self.stats['uncertainty_reduction_history'].append({
+            'total_reduction': total_uncertainty_reduction,
+            'affected_count': affected_count,
+            'avg_reduction': total_uncertainty_reduction / affected_count if affected_count > 0 else 0
+        })
+
+        if len(self.stats['uncertainty_reduction_history']) > 100:
+            self.stats['uncertainty_reduction_history'].pop(0)
+
+        return reward
+
+    def get_statistics(self):
+        """获取统计信息"""
+        recent_rewards = self.stats['reward_history'][-100:]
+        recent_reductions = self.stats['uncertainty_reduction_history'][-20:]
+
+        avg_reduction = 0
+        if recent_reductions:
+            avg_reduction = np.mean([r['avg_reduction'] for r in recent_reductions])
+
+        return {
+            'total_updates': self.stats['total_updates'],
+            'total_rewards': self.stats['total_rewards'],
+            'avg_reward': np.mean(recent_rewards) if recent_rewards else 0,
+            'std_reward': np.std(recent_rewards) if recent_rewards else 0,
+            'max_reward': np.max(recent_rewards) if recent_rewards else 0,
+            'min_reward': np.min(recent_rewards) if recent_rewards else 0,
+            'avg_uncertainty_reduction': avg_reduction,
+            'recent_rewards': recent_rewards[-10:]
+        }
+
+    def get_update_summary(self, time_window=300):
+        """获取更新摘要
+
+        Args:
+            time_window: 时间窗口（秒）
+
+        Returns:
+            dict: 更新摘要
+        """
+        current_time = time.time()
+        cutoff_time = current_time - time_window
+
+        # 统计各实体的更新情况
+        entity_updates = defaultdict(lambda: defaultdict(int))
+        metric_updates = defaultdict(int)
+
+        for (entity_id, metric), state in self.esm.state_table.items():
+            if state.last_update_time >= cutoff_time:
+                entity_updates[entity_id][metric] += 1
+                metric_updates[metric] += 1
+
+        return {
+            'time_window': time_window,
+            'total_entities_updated': len(entity_updates),
+            'updates_by_metric': dict(metric_updates),
+            'most_updated_entities': sorted(
+                entity_updates.items(),
+                key=lambda x: sum(x[1].values()),
+                reverse=True
+            )[:10]
+        }

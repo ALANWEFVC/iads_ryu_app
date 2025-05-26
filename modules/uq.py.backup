@@ -1,0 +1,137 @@
+# modules/uq.py
+"""不确定性量化器(UQ)模块"""
+
+import numpy as np
+from ..config import *
+from ..utils.distributions import BetaDistribution, GaussianDistribution
+
+
+class Task:
+    """探测任务"""
+
+    def __init__(self, entity_id, metric):
+        self.entity_id = entity_id
+        self.metric = metric
+        self.eig = 0.0  # 预期信息增益
+
+    def __str__(self):
+        return f"Task({self.entity_id},{self.metric})"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def to_dict(self):
+        return {
+            'entity_id': self.entity_id,
+            'metric': self.metric,
+            'eig': self.eig
+        }
+
+
+class UncertaintyQuantifier:
+    """不确定性量化器"""
+
+    def __init__(self, esm):
+        self.esm = esm  # ESM引用
+        self.task_pool = []  # 任务池
+        self._initialize_task_pool()
+
+    def _initialize_task_pool(self):
+        """初始化任务池"""
+        self.task_pool = []
+        for entity_id in self.esm.entities:
+            for metric in self.esm.metrics:
+                task = Task(entity_id, metric)
+                self.task_pool.append(task)
+
+    def update_entity_list(self):
+        """更新任务池（当实体列表变化时）"""
+        # 获取当前任务集合
+        current_tasks = {(t.entity_id, t.metric) for t in self.task_pool}
+
+        # 获取应有的任务集合
+        expected_tasks = {(entity_id, metric)
+                          for entity_id in self.esm.entities
+                          for metric in self.esm.metrics}
+
+        # 添加新任务
+        for entity_id, metric in expected_tasks - current_tasks:
+            task = Task(entity_id, metric)
+            self.task_pool.append(task)
+
+        # 移除旧任务
+        self.task_pool = [t for t in self.task_pool
+                          if (t.entity_id, t.metric) in expected_tasks]
+
+    def calculate_eig(self, task):
+        """计算单个任务的预期信息增益
+
+        Args:
+            task: Task对象
+
+        Returns:
+            float: EIG值
+        """
+        state = self.esm.get_state(task.entity_id, task.metric)
+        if not state:
+            return 0.0
+
+        # 当前熵
+        h_before = state.distribution.entropy()
+
+        # 预期探测后的熵
+        if isinstance(state.distribution, BetaDistribution):
+            h_after_expected = state.distribution.expected_entropy_after_probe()
+        else:  # GaussianDistribution
+            noise_var = MEASUREMENT_NOISE.get(task.metric, 1.0)
+            h_after_expected = state.distribution.expected_entropy_after_probe(noise_var)
+
+        # EIG = H_before - E[H_after]
+        eig = h_before - h_after_expected
+
+        return max(0.0, eig)  # 确保非负
+
+    def update_all_eigs(self):
+        """更新所有任务的EIG"""
+        for task in self.task_pool:
+            task.eig = self.calculate_eig(task)
+
+    def get_task_pool_with_eig(self):
+        """获取带EIG的任务池"""
+        self.update_all_eigs()
+        return [(task, task.eig) for task in self.task_pool]
+
+    def get_top_k_by_eig(self, k=10):
+        """获取EIG最高的K个任务"""
+        self.update_all_eigs()
+        sorted_tasks = sorted(self.task_pool, key=lambda t: t.eig, reverse=True)
+        return sorted_tasks[:k]
+
+    def get_statistics(self):
+        """获取统计信息"""
+        eigs = [task.eig for task in self.task_pool]
+
+        return {
+            'total_tasks': len(self.task_pool),
+            'avg_eig': np.mean(eigs) if eigs else 0,
+            'max_eig': np.max(eigs) if eigs else 0,
+            'min_eig': np.min(eigs) if eigs else 0,
+            'std_eig': np.std(eigs) if eigs else 0
+        }
+
+    def get_eig_by_entity(self):
+        """按实体统计EIG"""
+        entity_eigs = defaultdict(list)
+
+        for task in self.task_pool:
+            entity_eigs[task.entity_id].append(task.eig)
+
+        result = {}
+        for entity_id, eigs in entity_eigs.items():
+            result[entity_id] = {
+                'total_eig': sum(eigs),
+                'avg_eig': np.mean(eigs),
+                'max_eig': max(eigs)
+            }
+
+        return result

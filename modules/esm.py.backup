@@ -1,0 +1,221 @@
+# modules/esm.py
+"""实体状态管理器(ESM)模块"""
+
+import time
+from collections import defaultdict
+import numpy as np
+from ..config import *
+from ..utils.distributions import BetaDistribution, GaussianDistribution, StabilityCalculator
+
+
+class EntityState:
+    """单个实体-指标的状态"""
+
+    def __init__(self, entity_id, metric, dist_params=None):
+        self.entity_id = entity_id
+        self.metric = metric
+        self.last_update_time = 0
+        self.probe_interval = SYSTEM_CONFIG['probe_interval_default']
+
+        # 初始化分布
+        if dist_params is None:
+            dist_params = DISTRIBUTION_INIT[metric]
+
+        if dist_params['type'] == 'beta':
+            self.distribution = BetaDistribution(
+                dist_params['alpha'],
+                dist_params['beta']
+            )
+        else:  # gaussian
+            self.distribution = GaussianDistribution(
+                dist_params['mu'],
+                dist_params['sigma2']
+            )
+
+        # 稳定性计算器
+        self.stability_calculator = StabilityCalculator(
+            SYSTEM_CONFIG['sliding_window']
+        )
+
+        # 缓存的不确定性和稳定性值
+        self._cached_uncertainty = None
+        self._cached_stability = None
+        self._cache_time = 0
+
+    def get_uncertainty(self):
+        """获取不确定性H(i,m)"""
+        current_time = time.time()
+        if self._cached_uncertainty is None or current_time - self._cache_time > 1:
+            self._cached_uncertainty = self.distribution.entropy()
+            self._cache_time = current_time
+        return self._cached_uncertainty
+
+    def get_stability(self):
+        """获取稳定性S(i,m)"""
+        return self.stability_calculator.get_normalized_stability(
+            APS_CONFIG['max_stability']
+        )
+
+    def update(self, measurement, timestamp=None):
+        """更新状态"""
+        if timestamp is None:
+            timestamp = time.time()
+
+        self.last_update_time = timestamp
+
+        # 更新分布
+        if isinstance(self.distribution, BetaDistribution):
+            # Liveness: measurement是布尔值
+            self.distribution.update(measurement)
+        else:
+            # RTT/PLR/Bandwidth: measurement是数值
+            noise_var = MEASUREMENT_NOISE.get(self.metric, 1.0)
+            self.distribution.update(measurement, noise_var)
+            # 添加到稳定性计算器
+            self.stability_calculator.add_measurement(measurement, timestamp)
+
+        # 清除缓存
+        self._cached_uncertainty = None
+        self._cached_stability = None
+
+    def get_urgency(self, current_time=None):
+        """计算紧急度"""
+        if current_time is None:
+            current_time = time.time()
+
+        time_since_update = current_time - self.last_update_time
+        return time_since_update / self.probe_interval if self.probe_interval > 0 else 0
+
+    def to_dict(self):
+        """转换为字典"""
+        return {
+            'entity_id': self.entity_id,
+            'metric': self.metric,
+            'distribution': self.distribution.to_dict(),
+            'uncertainty': self.get_uncertainty(),
+            'stability': self.get_stability(),
+            'last_update_time': self.last_update_time,
+            'probe_interval': self.probe_interval,
+            'urgency': self.get_urgency()
+        }
+
+
+class EntityStateManager:
+    """实体状态管理器"""
+
+    def __init__(self):
+        # 状态表: {(entity_id, metric): EntityState}
+        self.state_table = {}
+        # 实体列表
+        self.entities = set()
+        # 指标列表
+        self.metrics = list(METRICS.values())
+
+    def add_entity(self, entity_id):
+        """添加新实体"""
+        if entity_id in self.entities:
+            return
+
+        self.entities.add(entity_id)
+
+        # 为每个指标创建状态
+        for metric in self.metrics:
+            key = (entity_id, metric)
+            self.state_table[key] = EntityState(entity_id, metric)
+
+    def remove_entity(self, entity_id):
+        """移除实体"""
+        if entity_id not in self.entities:
+            return
+
+        self.entities.remove(entity_id)
+
+        # 移除相关状态
+        for metric in self.metrics:
+            key = (entity_id, metric)
+            if key in self.state_table:
+                del self.state_table[key]
+
+    def get_state(self, entity_id, metric):
+        """获取特定状态"""
+        key = (entity_id, metric)
+        return self.state_table.get(key)
+
+    def update_state(self, entity_id, metric, measurement, timestamp=None):
+        """更新状态"""
+        state = self.get_state(entity_id, metric)
+        if state:
+            state.update(measurement, timestamp)
+
+    def set_probe_interval(self, entity_id, metric, interval):
+        """设置探测间隔"""
+        state = self.get_state(entity_id, metric)
+        if state:
+            state.probe_interval = interval
+
+    def get_context_vector(self):
+        """生成上下文向量c
+        c = [avg_uncertainty, num_recent_events, unstable_entity_ratio, avg_stable_urgency]
+        """
+        if not self.state_table:
+            return np.array([0.0, 0.0, 0.0, 0.0])
+
+        # 1. 平均不确定性
+        uncertainties = [state.get_uncertainty() for state in self.state_table.values()]
+        avg_uncertainty = np.mean(uncertainties) if uncertainties else 0
+
+        # 2. 最近事件数 (由EM提供，这里暂时返回0)
+        num_recent_events = 0
+
+        # 3. 不稳定实体比例
+        unstable_count = 0
+        for entity_id in self.entities:
+            # 检查实体的任何指标是否不稳定
+            is_unstable = False
+            for metric in self.metrics:
+                state = self.get_state(entity_id, metric)
+                if state and state.get_stability() > EVENT_THRESHOLDS['stability_threshold'] / APS_CONFIG[
+                    'max_stability']:
+                    is_unstable = True
+                    break
+            if is_unstable:
+                unstable_count += 1
+
+        unstable_entity_ratio = unstable_count / len(self.entities) if self.entities else 0
+
+        # 4. 稳定实体的平均紧急度
+        stable_urgencies = []
+        current_time = time.time()
+        for state in self.state_table.values():
+            if state.get_stability() <= EVENT_THRESHOLDS['stability_threshold'] / APS_CONFIG['max_stability']:
+                stable_urgencies.append(state.get_urgency(current_time))
+
+        avg_stable_urgency = np.mean(stable_urgencies) if stable_urgencies else 0
+
+        # 归一化
+        context = np.array([
+            avg_uncertainty / APS_CONFIG['max_uncertainty'],
+            num_recent_events / EVENT_THRESHOLDS['max_recent_events'],
+            unstable_entity_ratio,
+            min(avg_stable_urgency / 2.0, 1.0)  # 假设2个探测周期为最大值
+        ])
+
+        return context
+
+    def get_all_states(self):
+        """获取所有状态"""
+        return {key: state.to_dict() for key, state in self.state_table.items()}
+
+    def get_statistics(self):
+        """获取统计信息"""
+        total_states = len(self.state_table)
+        avg_uncertainty = np.mean([s.get_uncertainty() for s in self.state_table.values()]) if total_states > 0 else 0
+        avg_stability = np.mean([s.get_stability() for s in self.state_table.values()]) if total_states > 0 else 0
+
+        return {
+            'total_entities': len(self.entities),
+            'total_states': total_states,
+            'avg_uncertainty': avg_uncertainty,
+            'avg_stability': avg_stability,
+            'context_vector': self.get_context_vector().tolist()
+        }
